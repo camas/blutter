@@ -34,7 +34,7 @@ else()
 	include(FindPkgConfig)
 	pkg_search_module(CAPSTONE REQUIRED capstone)
 	link_directories(${CAPSTONE_LIBDIR})
-	include_directories(AFTER ${CAPSTONE_INCLUDEDIR})
+	include_directories(AFTER ${CAPSTONE_INCLUDE_DIRS})
 endif()
 
 # Add source to this project's executable.

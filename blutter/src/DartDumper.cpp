@@ -874,3 +874,393 @@ void DartDumper::DumpObjects(const char* filename)
 		of << "\n\n";
 	}
 }
+
+// JSON string escaping helper
+static std::string jsonEscape(const std::string& s)
+{
+	std::string out;
+	out.reserve(s.size() + 16);
+	for (char c : s) {
+		switch (c) {
+		case '"': out += "\\\""; break;
+		case '\\': out += "\\\\"; break;
+		case '\n': out += "\\n"; break;
+		case '\r': out += "\\r"; break;
+		case '\t': out += "\\t"; break;
+		default:
+			if (static_cast<unsigned char>(c) < 0x20)
+				out += std::format("\\u{:04x}", (int)(unsigned char)c);
+			else
+				out += c;
+		}
+	}
+	return out;
+}
+
+void DartDumper::Dump4Ghidra(const char* filename)
+{
+	std::ofstream of(filename);
+
+	// Pool base
+	const auto& pool = app.GetObjectPool();
+	const auto& rawObj = pool.ptr()->untag();
+	const auto raw_addr = dart::UntaggedObject::ToAddr(rawObj);
+	const auto pool_base = raw_addr - app.heap_base();
+
+	of << "{\n";
+
+	// Metadata
+	of << "\"pool_base\": " << pool_base << ",\n";
+
+	// ---- Thread offsets ----
+	of << "\"thread_offsets\": [\n";
+	{
+		auto& threadMap = GetThreadOffsetsMap();
+		bool first = true;
+		for (auto& [offset, name] : threadMap) {
+			if (!first) of << ",\n";
+			of << std::format("  {{\"offset\": {}, \"name\": \"{}\"}}", offset, jsonEscape(name));
+			first = false;
+		}
+	}
+	of << "\n],\n";
+
+	// ---- Functions ----
+	of << "\"functions\": [\n";
+	{
+		bool first = true;
+		for (auto lib : app.libs) {
+			std::string lib_prefix = lib->GetName();
+			for (auto cls : lib->classes) {
+				std::string cls_prefix = cls->Name();
+				for (auto dartFn : cls->Functions()) {
+					const auto ep = dartFn->Address();
+					if (dartFn->Size() <= 0) continue;
+					auto name = getFunctionName4Ida(*dartFn, cls_prefix);
+					auto fullName = std::format("{}_{}::{}", lib_prefix, cls_prefix, name);
+					if (!first) of << ",\n";
+					of << std::format("  {{\"addr\": {}, \"end\": {}, \"name\": \"{}\"}}",
+						ep, ep + dartFn->Size(), jsonEscape(fullName));
+					first = false;
+				}
+			}
+		}
+	}
+	of << "\n],\n";
+
+	// ---- Stubs ----
+	of << "\"stubs\": [\n";
+	{
+		bool first = true;
+		for (auto& item : app.stubs) {
+			auto stub = item.second;
+			const auto ep = stub->Address();
+			auto name = stub->FullName();
+			if (!first) of << ",\n";
+			of << std::format("  {{\"addr\": {}, \"end\": {}, \"name\": \"{}\"}}",
+				ep, ep + (stub->Size() > 0 ? stub->Size() : 0), jsonEscape(name));
+			first = false;
+		}
+	}
+	of << "\n],\n";
+
+	// ---- Pool entries ----
+	of << "\"pool_entries\": [\n";
+	{
+		bool first = true;
+		intptr_t num = pool.Length();
+		for (intptr_t i = 0; i < num; i++) {
+			intptr_t offset = dart::ObjectPool::OffsetFromIndex(i) + 1;
+			intptr_t idx = dart::ObjectPool::IndexFromOffset(offset);
+			auto objType = pool.TypeAt(idx);
+
+			if (!first) of << ",\n";
+
+			if (objType == dart::ObjectPool::EntryType::kTaggedObject) {
+				auto& obj = dart::Object::Handle(pool.ObjectAt(idx));
+				if (obj.IsUnlinkedCall()) {
+					// UnlinkedCall spans 2 entries
+					auto desc = getPoolObjectDescription(offset, true);
+					of << std::format("  {{\"offset\": {}, \"type\": \"unlinked_call\", \"desc\": \"{}\"}}",
+						offset, jsonEscape(desc));
+					i++;
+				}
+				else if (obj.IsString()) {
+					auto& val = getQuoteString(obj);
+					// Remove surrounding quotes from the value
+					std::string strVal = val;
+					if (strVal.size() >= 2 && strVal.front() == '"' && strVal.back() == '"')
+						strVal = strVal.substr(1, strVal.size() - 2);
+					of << std::format("  {{\"offset\": {}, \"type\": \"string\", \"value\": \"{}\"}}",
+						offset, jsonEscape(strVal));
+				}
+				else if (obj.IsCode()) {
+					auto& code = dart::Code::Cast(obj);
+					auto fn = app.GetFunction(code.EntryPoint() - app.base());
+					std::string stubName = fn ? fn->FullName() : "unknown";
+					of << std::format("  {{\"offset\": {}, \"type\": \"stub\", \"name\": \"{}\", \"addr\": {}}}",
+						offset, jsonEscape(stubName), fn ? fn->Address() : 0);
+				}
+				else {
+					auto desc = ObjectToString(obj, true);
+					of << std::format("  {{\"offset\": {}, \"type\": \"object\", \"desc\": \"{}\"}}",
+						offset, jsonEscape(desc));
+				}
+			}
+			else if (objType == dart::ObjectPool::EntryType::kImmediate) {
+				dart::uword imm = pool.RawValueAt(idx);
+				of << std::format("  {{\"offset\": {}, \"type\": \"immediate\", \"value\": {}}}",
+					offset, imm);
+			}
+			else if (objType == dart::ObjectPool::EntryType::kNativeFunction) {
+				auto pc = pool.RawValueAt(idx);
+				uintptr_t start = 0;
+				auto name = dart::NativeSymbolResolver::LookupSymbolName(pc, &start);
+				std::string fnName = name ? name : "";
+				if (name) dart::NativeSymbolResolver::FreeSymbolName(name);
+				of << std::format("  {{\"offset\": {}, \"type\": \"native\", \"name\": \"{}\", \"addr\": {}}}",
+					offset, jsonEscape(fnName), pc);
+			}
+			first = false;
+		}
+	}
+	of << "\n],\n";
+
+	// ---- Classes with field metadata ----
+	// First pass: collect Field<ClassName, Type> metadata from object pool
+	// These Field objects contain real field names and JSON serialization keys
+	struct FieldMeta {
+		std::string name;       // Dart field name
+		std::string jsonKey;    // JSON serialization key
+		std::string typeName;   // type string
+		bool nullable;
+	};
+	// class_name -> ordered list of field metadata
+	std::unordered_map<std::string, std::vector<FieldMeta>> classFieldMeta;
+
+	// Helper lambda to extract FieldMeta from a Field<> instance object
+	auto extractFieldMeta = [&](dart::Object& fieldObj, const std::string& ownerClass) {
+		auto fieldCid = fieldObj.GetClassId();
+		if (fieldCid < dart::kNumPredefinedCids || fieldCid >= (intptr_t)app.classes.size()) return;
+		auto* fieldCls = app.classes[fieldCid];
+		if (!fieldCls) return;
+
+		// Parse type from class full name: Field<OwnerClass, FieldType>
+		auto fullName = fieldCls->FullName();
+		auto commaPos = fullName.find(',');
+		auto gtPos = fullName.rfind('>');
+		std::string fieldType = (commaPos != std::string::npos && gtPos != std::string::npos)
+			? fullName.substr(commaPos + 2, gtPos - commaPos - 2) : "dynamic";
+
+		auto ptr = dart::UntaggedObject::ToAddr(fieldObj.ptr());
+		auto bitmap = fieldCls->UnboxedFieldsBitmap();
+		FieldMeta meta;
+		meta.typeName = fieldType;
+		meta.nullable = false;
+
+		// off_c (offset 0xc): field name string
+		if (0xc < fieldCls->Size() && !bitmap.Get(0xc / dart::kCompressedWordSize)) {
+			auto p = reinterpret_cast<dart::CompressedObjectPtr*>(ptr + 0xc);
+			if (p->IsHeapObject()) {
+				auto nameObj = p->Decompress(app.heap_base());
+				if (nameObj != nullptr && (nameObj.GetClassId() == dart::kOneByteStringCid || nameObj.GetClassId() == dart::kTwoByteStringCid)) {
+					auto& strHandle = dart::Object::Handle(nameObj);
+					meta.name = dart::String::Cast(strHandle).ToCString();
+				}
+			}
+		}
+
+		// off_14 (offset 0x14): json serialization key
+		if (0x14 < fieldCls->Size() && !bitmap.Get(0x14 / dart::kCompressedWordSize)) {
+			auto p = reinterpret_cast<dart::CompressedObjectPtr*>(ptr + 0x14);
+			if (p->IsHeapObject()) {
+				auto keyObj = p->Decompress(app.heap_base());
+				if (keyObj != nullptr && (keyObj.GetClassId() == dart::kOneByteStringCid || keyObj.GetClassId() == dart::kTwoByteStringCid)) {
+					auto& strHandle = dart::Object::Handle(keyObj);
+					meta.jsonKey = dart::String::Cast(strHandle).ToCString();
+				}
+			}
+		}
+
+		// off_20 (offset 0x20): nullable flag
+		if (0x20 < fieldCls->Size() && bitmap.Get(0x20 / dart::kCompressedWordSize)) {
+			auto p = reinterpret_cast<uint64_t*>(ptr + 0x20);
+			meta.nullable = (*p != 0);
+		}
+
+		if (!meta.name.empty()) {
+			classFieldMeta[ownerClass].push_back(meta);
+		}
+	};
+
+	// Search pool for Map<Symbol, Field<ClassName, dynamic>> entries
+	// and extract field metadata from the Field values inside those Maps
+	{
+		intptr_t num = pool.Length();
+		for (intptr_t i = 0; i < num; i++) {
+			intptr_t offset = dart::ObjectPool::OffsetFromIndex(i) + 1;
+			auto objType = pool.TypeAt(dart::ObjectPool::IndexFromOffset(offset));
+			if (objType != dart::ObjectPool::EntryType::kTaggedObject) continue;
+
+			auto& obj = dart::Object::Handle(pool.ObjectAt(dart::ObjectPool::IndexFromOffset(offset)));
+
+			// Check for Map objects (Map<Symbol, Field<ClassName, dynamic>>)
+			if (obj.GetClassId() == dart::kConstMapCid) {
+				auto& map = dart::Map::Cast(obj);
+				const auto typeArg = app.typeDb->FindOrAdd(map.GetTypeArguments());
+				auto typeStr = typeArg->ToString();
+
+				// Check if this is a Map<Symbol, Field<SomeClass, dynamic>>
+				if (typeStr.find("Field<") == std::string::npos) continue;
+
+				// Extract the owner class name from the type: Map<Symbol, Field<OwnerClass, dynamic>>
+				auto fieldLt = typeStr.find("Field<");
+				if (fieldLt == std::string::npos) continue;
+				auto classStart = fieldLt + 6; // after "Field<"
+				auto classEnd = typeStr.find(',', classStart);
+				if (classEnd == std::string::npos) continue;
+				auto ownerClass = typeStr.substr(classStart, classEnd - classStart);
+
+				// Iterate map values to extract each Field<> object
+				dart::Map::Iterator iter(map);
+				auto& key = dart::Object::Handle();
+				auto& val = dart::Object::Handle();
+				while (iter.MoveNext()) {
+					key = iter.CurrentKey();
+					val = iter.CurrentValue();
+					if (val.GetClassId() >= dart::kNumPredefinedCids) {
+						extractFieldMeta(val, ownerClass);
+					}
+				}
+			}
+		}
+	}
+
+	of << "\"classes\": [\n";
+	{
+		bool first = true;
+		for (size_t cid = 0; cid < app.classes.size(); cid++) {
+			auto* cls = app.classes[cid];
+			if (!cls || cls->Size() <= 0) continue;
+
+			if (!first) of << ",\n";
+			of << std::format("  {{\"name\": \"{}\", \"id\": {}, \"size\": {}",
+				jsonEscape(cls->Name()), cid, cls->Size());
+
+			// Add fields from Field<> metadata if available
+			auto metaIt = classFieldMeta.find(cls->Name());
+			if (metaIt != classFieldMeta.end() && !metaIt->second.empty()) {
+				of << ", \"fields\": [";
+				bool firstField = true;
+				// Fields don't have offset info in the metadata directly,
+				// but we know class fields start at offset 8 and are 4 bytes apart
+				// The order in the Map<Symbol, Field> may not be offset order,
+				// so we just output the metadata we have
+				int fieldIdx = 0;
+				for (auto& fm : metaIt->second) {
+					if (!firstField) of << ", ";
+					// tagged offset = real offset - 1
+					int taggedOffset = 8 + fieldIdx * dart::kCompressedWordSize - 1;
+					of << std::format("{{\"offset\": {}, \"name\": \"{}\", \"type\": \"{}\", \"json_key\": \"{}\", \"nullable\": {}}}",
+						taggedOffset, jsonEscape(fm.name), jsonEscape(fm.typeName),
+						jsonEscape(fm.jsonKey), fm.nullable ? "true" : "false");
+					firstField = false;
+					fieldIdx++;
+				}
+				of << "]";
+			}
+			// Also add raw field offsets from class definition
+			else if (!cls->Fields().empty()) {
+				of << ", \"fields\": [";
+				bool firstField = true;
+				for (auto* field : cls->Fields()) {
+					if (!firstField) of << ", ";
+					int taggedOffset = field->Offset() - 1;
+					of << std::format("{{\"offset\": {}, \"name\": \"{}\", \"type\": \"{}\", \"static\": {}}}",
+						taggedOffset, jsonEscape(field->Name()),
+						field->Type() ? jsonEscape(field->Type()->ToString()) : "dynamic",
+						field->IsStatic() ? "true" : "false");
+					firstField = false;
+				}
+				of << "]";
+			}
+
+			of << "}";
+			first = false;
+		}
+	}
+	of << "\n],\n";
+
+	// ---- Comments from code analysis ----
+	of << "\"comments\": [\n";
+	{
+		bool first = true;
+#ifndef NO_CODE_ANALYSIS
+		for (auto lib : app.libs) {
+			for (auto cls : lib->classes) {
+				for (auto dartFn : cls->Functions()) {
+					if (dartFn->Size() <= 0 || !dartFn->GetAnalyzedData()) continue;
+
+					auto& asmTexts = dartFn->GetAnalyzedData()->asmTexts.Data();
+					auto& il_insns = dartFn->GetAnalyzedData()->il_insns;
+					auto il_itr = il_insns.begin();
+					AddrRange range;
+
+					for (auto& asmText : asmTexts) {
+						std::string comment;
+
+						// Get IL annotation if this address starts an IL instruction
+						if (!range.Has(asmText.addr)) {
+							while (il_itr != il_insns.end() && (*il_itr)->Start() < asmText.addr)
+								++il_itr;
+							if (il_itr != il_insns.end() && (*il_itr)->Start() == asmText.addr) {
+								if ((*il_itr)->Kind() != ILInstr::Unknown)
+									comment = (*il_itr)->ToString();
+								range = (*il_itr)->Range();
+								++il_itr;
+							}
+						}
+
+						// Get extra annotation from data type
+						std::string extra;
+						switch (asmText.dataType) {
+						case AsmText::ThreadOffset:
+							extra = "THR::" + GetThreadOffsetName(asmText.threadOffset);
+							break;
+						case AsmText::PoolOffset:
+							extra = getPoolObjectDescription(asmText.poolOffset);
+							break;
+						case AsmText::Boolean:
+							extra = asmText.boolVal ? "true" : "false";
+							break;
+						case AsmText::Call: {
+							auto* fn = app.GetFunction(asmText.callAddress);
+							if (fn) extra = fn->FullName();
+							break;
+						}
+						}
+
+						if (!comment.empty() || !extra.empty()) {
+							std::string combined;
+							if (!comment.empty() && !extra.empty())
+								combined = comment + " | " + extra;
+							else if (!comment.empty())
+								combined = comment;
+							else
+								combined = extra;
+
+							if (!first) of << ",\n";
+							of << std::format("  {{\"addr\": {}, \"text\": \"{}\"}}",
+								asmText.addr, jsonEscape(combined));
+							first = false;
+						}
+					}
+				}
+			}
+		}
+#endif
+	}
+	of << "\n]\n";
+
+	of << "}\n";
+}

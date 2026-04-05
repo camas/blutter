@@ -53,6 +53,9 @@ int main(int argc, char** argv)
 		dumper.DumpCode((outDir / "asm").string().c_str());
 		dumper.Dump4Ida(outDir / "ida_script");
 
+		std::cout << "Generating Ghidra JSON\n";
+		dumper.Dump4Ghidra((outDir / "ghidra.json").string().c_str());
+
 		std::cout << "Generating Frida script\n";
 		FridaWriter fwriter{ app };
 		fwriter.Create((outDir / "blutter_frida.js").string().c_str());
